@@ -209,6 +209,7 @@ jobs:
 
       - name: Release
         uses: softprops/action-gh-release@v1
-        if: startsWith(github.ref, 'refs/tags/')
+        if: env.VERSION != ''
         with:
+          tag_name: ${{ env.VERSION }}
           files: rp-lkms.zip
