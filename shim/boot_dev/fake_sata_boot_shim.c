@@ -44,7 +44,7 @@
 #include <scsi/scsi_device.h> //struct scsi_device
 #include <scsi/scsi_host.h> //struct Scsi_Host, SYNO_PORT_TYPE_*
 #include <linux/usb.h> //struct usb_device
-#include <../drivers/usb/storage/usb.h> //struct us_data
+#include "../../compat/toolkit/drivers/usb/storage/usb.h" //struct us_data
 
 #define SHIM_NAME "fake SATA boot device"
 
