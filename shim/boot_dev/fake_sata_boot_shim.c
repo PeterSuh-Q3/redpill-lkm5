@@ -35,27 +35,27 @@
  */
 #include "fake_sata_boot_shim.h"
 #include "boot_shim_base.h" //set_shimmed_boot_dev(), get_shimmed_boot_dev(), scsi_is_shim_target(), usb_shim_as_boot_dev()
-#include "../shim_base.h" //shim_*
+#include "../shim_base.h"   //shim_*
 #include "../../common.h"
-#include "../../internal/scsi/scsi_toolbox.h" //scsi_force_replug()
-#include "../../internal/scsi/scsi_notifier.h" //waiting for the drive to appear
-#include "../../internal/call_protected.h" //ida_pre_get/ida_alloc_range()
+#include "../../internal/scsi/scsi_toolbox.h"        //scsi_force_replug()
+#include "../../internal/scsi/scsi_notifier.h"       //waiting for the drive to appear
+#include "../../internal/call_protected.h"           //ida_pre_get/ida_alloc_range()
 #include "../../internal/override/override_symbol.h" //overriding ida_pre_get/ida_alloc_range()
-#include <scsi/scsi_device.h> //struct scsi_device
-#include <scsi/scsi_host.h> //struct Scsi_Host, SYNO_PORT_TYPE_*
-#include <linux/usb.h> //struct usb_device
-#include <../drivers/usb/storage/usb.h> //struct us_data
+#include <scsi/scsi_device.h>                        //struct scsi_device
+#include <scsi/scsi_host.h>                          //struct Scsi_Host, SYNO_PORT_TYPE_*
+#include <linux/usb.h>                               //struct usb_device
+#include "../../compat/toolkit/drivers/usb/storage/usb.h"              //struct us_data
 
 #define SHIM_NAME "fake SATA boot device"
 
-static const struct boot_media *boot_dev_config = NULL; //passed to scsi_is_shim_target() & usb_shim_as_boot_dev()
-static struct scsi_device *camouflaged_sdp = NULL; //set when ANY device is under camouflage
-static struct usb_device *fake_usbd = NULL; //ptr to our fake usb device scaffolding
-static int org_port_type = 0; //original port type of the device which registered
-static override_symbol_inst *ida_X_ovs = NULL; //trap override
-static unsigned long irq_flags = 0; //saved flags when IRQs are disabled (to prevent rescheduling)
+static const struct boot_media *boot_dev_config = NULL; // passed to scsi_is_shim_target() & usb_shim_as_boot_dev()
+static struct scsi_device *camouflaged_sdp = NULL;      // set when ANY device is under camouflage
+static struct usb_device *fake_usbd = NULL;             // ptr to our fake usb device scaffolding
+static int org_port_type = 0;                           // original port type of the device which registered
+static override_symbol_inst *ida_X_ovs = NULL;          // trap override
+static unsigned long irq_flags = 0;                     // saved flags when IRQs are disabled (to prevent rescheduling)
 
-//They call each other, see their own docblocks
+// They call each other, see their own docblocks
 static int camouflage_device(struct scsi_device *sdp);
 static int uncamouflage_device(struct scsi_device *sdp);
 
@@ -65,13 +65,14 @@ struct ida;
  */
 static int ida_X_trap(struct ida *ida, gfp_t gfp_mask)
 {
-    //This can happen if the kernel decides to reschedule and/or some device appears JUST between setting up the trap
-    // and disabling of rescheduling. We cannot reverse the order as setting up the trap requires flushing CPU caches
-    // which isn't really feasible in non-preempt & IRQ-disabled state... a catch-22
-    //It is also possible that it happens during uncamouflage_device - this is why we force-restore here and just call
-    // it.
-    if (unlikely(!camouflaged_sdp)) {
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4,19,0)
+    // This can happen if the kernel decides to reschedule and/or some device appears JUST between setting up the trap
+    //  and disabling of rescheduling. We cannot reverse the order as setting up the trap requires flushing CPU caches
+    //  which isn't really feasible in non-preempt & IRQ-disabled state... a catch-22
+    // It is also possible that it happens during uncamouflage_device - this is why we force-restore here and just call
+    //  it.
+    if (unlikely(!camouflaged_sdp))
+    {
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 19, 0)
         pr_loc_bug("Hit ida_pr_get() trap without sdp saved - removing trap and calling original");
         restore_symbol(ida_X_ovs);
         return _ida_pre_get(ida, gfp_mask);
@@ -82,14 +83,14 @@ static int ida_X_trap(struct ida *ida, gfp_t gfp_mask)
 #endif
     }
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4,19,0)
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 19, 0)
     pr_loc_dbg("Hit ida_pre_get() trap! Removing camouflage...");
 #else
     pr_loc_dbg("Hit ida_alloc_range() trap! Removing camouflage...");
 #endif
     uncamouflage_device(camouflaged_sdp);
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4,19,0)
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 19, 0)
     pr_loc_dbg("Calling original ida_pre_get()");
     return _ida_pre_get(ida, gfp_mask);
 #else
@@ -119,29 +120,32 @@ static bool is_camouflaged(struct scsi_device *sdp)
  */
 static int camouflage_device(struct scsi_device *sdp)
 {
-    //This is very serious - it means something went TERRIBLY wrong. The camouflage should last only through the
-    // duration of probing. If we got here again before camouflaging it means there's a device floating around which
-    // is a SATA device but with broken USB descriptors. This should never ever happen as it may lead to data loss and
-    // crashes at best.
-    if (unlikely(camouflaged_sdp)) {
+    // This is very serious - it means something went TERRIBLY wrong. The camouflage should last only through the
+    //  duration of probing. If we got here again before camouflaging it means there's a device floating around which
+    //  is a SATA device but with broken USB descriptors. This should never ever happen as it may lead to data loss and
+    //  crashes at best.
+    if (unlikely(camouflaged_sdp))
+    {
         pr_loc_crt("Attempting to camouflage when another device is undergoing camouflage");
         return -EEXIST;
     }
 
-    //Here's the kicker: most of the subsystems save a pointer to some driver-related data into sdp->host->hostdata.
-    // Unfortunately usb-storage saves a whole us_data structure there. It can do that as it allows them to use some
-    // neat container_of() tricks later on. However, it means that we must fake that arrangement. This means we have to
-    // practically go over the boundaries of the struct memory passed as ->pusb_dev is simply +40 bytes over the struct
-    // (+ 8 bytes to save the ptr). USUALLY it should be safe as there's spare empty space due to memory fragmentation.
-    // Since we're doing this only for a short moment it shouldn't be a problem but we are making sure here the memory
-    // is indeed empty where we want to make a change. There's no guarantees that we don't damage anything but with all
-    // the safeguards here the chance is minimal.
-    if (unlikely(host_to_us(sdp->host)->pusb_dev)) {
+    // Here's the kicker: most of the subsystems save a pointer to some driver-related data into sdp->host->hostdata.
+    //  Unfortunately usb-storage saves a whole us_data structure there. It can do that as it allows them to use some
+    //  neat container_of() tricks later on. However, it means that we must fake that arrangement. This means we have to
+    //  practically go over the boundaries of the struct memory passed as ->pusb_dev is simply +40 bytes over the struct
+    //  (+ 8 bytes to save the ptr). USUALLY it should be safe as there's spare empty space due to memory fragmentation.
+    //  Since we're doing this only for a short moment it shouldn't be a problem but we are making sure here the memory
+    //  is indeed empty where we want to make a change. There's no guarantees that we don't damage anything but with all
+    //  the safeguards here the chance is minimal.
+    if (unlikely(host_to_us(sdp->host)->pusb_dev))
+    {
         pr_loc_crt("Cannot camouflage - space on pointer not empty");
         return -EINVAL;
     }
 
-    if (unlikely(get_shimmed_boot_dev())) {
+    if (unlikely(get_shimmed_boot_dev()))
+    {
         pr_loc_wrn("Refusing to camouflage. Boot device was already shimmed but a new matching device appeared again - "
                    "this may produce unpredictable outcomes! Ignoring - check your hardware");
         return -EEXIST;
@@ -154,15 +158,16 @@ static int camouflage_device(struct scsi_device *sdp)
     kzalloc_or_exit_int(fake_usbd, sizeof(struct usb_device));
     usb_shim_as_boot_dev(boot_dev_config, fake_usbd);
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4,19,0)
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 19, 0)
     pr_loc_dbg("Setting-up ida_pre_get() trap");
     ida_X_ovs = override_symbol("ida_pre_get", ida_X_trap);
 #else
     pr_loc_dbg("Setting-up ida_alloc_range() trap");
     ida_X_ovs = override_symbol("ida_alloc_range", ida_X_trap);
 #endif
-    if (unlikely(IS_ERR(ida_X_ovs))) {
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4,19,0)
+    if (unlikely(IS_ERR(ida_X_ovs)))
+    {
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 19, 0)
         pr_loc_err("Failed to override ida_pre_get - error=%ld", PTR_ERR(ida_X_ovs));
 #else
         pr_loc_err("Failed to override ida_alloc_range - error=%ld", PTR_ERR(ida_X_ovs));
@@ -201,8 +206,9 @@ static int uncamouflage_device(struct scsi_device *sdp)
     int out = 0;
     pr_loc_dbg("Uncamouflaging SATA disk vendor=\"%s\" model=\"%s\"", sdp->vendor, sdp->model);
 
-    if (unlikely(host_to_us(sdp->host)->pusb_dev != fake_usbd)) {
-                pr_loc_bug("Fake USB device in the scsi_device is not the same as our fake one - something changed it");
+    if (unlikely(host_to_us(sdp->host)->pusb_dev != fake_usbd))
+    {
+        pr_loc_bug("Fake USB device in the scsi_device is not the same as our fake one - something changed it");
         return -EINVAL;
     }
 
@@ -218,15 +224,16 @@ static int uncamouflage_device(struct scsi_device *sdp)
     pr_loc_dbg("Re-enabling scheduling");
     local_irq_restore(irq_flags);
     preempt_enable();
-    if (likely(ida_X_ovs)) { //scheduling race condition may have removed that already in ida_pre_get_trap()
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4,19,0)
+    if (likely(ida_X_ovs))
+    { // scheduling race condition may have removed that already in ida_pre_get_trap()
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 19, 0)
         pr_loc_dbg("Removing ida_pre_get() trap");
         if ((out = restore_symbol(ida_X_ovs)) != 0)
-        pr_loc_err ("Failed to restore original ida_pre_get() - error=%d", out);
+            pr_loc_err("Failed to restore original ida_pre_get() - error=%d", out);
 #else
         pr_loc_dbg("Removing ida_alloc_range() trap");
         if ((out = restore_symbol(ida_X_ovs)) != 0)
-        pr_loc_err ("Failed to restore original ida_alloc_range() - error=%d", out);
+            pr_loc_err("Failed to restore original ida_alloc_range() - error=%d", out);
 #endif
         ida_X_ovs = NULL;
     }
@@ -267,38 +274,40 @@ static int scsi_disk_probe_handler(struct notifier_block *self, unsigned long st
 {
     struct scsi_device *sdp = data;
 
-    switch (state) {
-        case SCSI_EVT_DEV_PROBING:
-            if (unlikely(camouflaged_sdp)) {
-                pr_loc_bug("Got device probe when other one is camouflaged - surprise reschedule happened?");
-                uncamouflage_device(camouflaged_sdp);
-                return NOTIFY_OK;
-            }
-
-            if (scsi_is_boot_dev_target(boot_dev_config, data))
-                camouflage_device(sdp);
-
+    switch (state)
+    {
+    case SCSI_EVT_DEV_PROBING:
+        if (unlikely(camouflaged_sdp))
+        {
+            pr_loc_bug("Got device probe when other one is camouflaged - surprise reschedule happened?");
+            uncamouflage_device(camouflaged_sdp);
             return NOTIFY_OK;
+        }
 
-        case SCSI_EVT_DEV_PROBED_OK:
-        case SCSI_EVT_DEV_PROBED_ERR:
-            if (is_camouflaged(sdp)) { //camouflage is expected to be removed by the ida_pre_get() trap
-                pr_loc_bug("Probing finished but device is still camouflages - something went terribly wrong");
-                uncamouflage_device(sdp);
-            }
+        if (scsi_is_boot_dev_target(boot_dev_config, data))
+            camouflage_device(sdp);
 
-            return NOTIFY_OK;
+        return NOTIFY_OK;
 
-        default:
-            pr_loc_dbg("Not interesting SCSI EVT %lu - ignoring", state);
-            return NOTIFY_DONE;
+    case SCSI_EVT_DEV_PROBED_OK:
+    case SCSI_EVT_DEV_PROBED_ERR:
+        if (is_camouflaged(sdp))
+        { // camouflage is expected to be removed by the ida_pre_get() trap
+            pr_loc_bug("Probing finished but device is still camouflages - something went terribly wrong");
+            uncamouflage_device(sdp);
+        }
+
+        return NOTIFY_OK;
+
+    default:
+        pr_loc_dbg("Not interesting SCSI EVT %lu - ignoring", state);
+        return NOTIFY_DONE;
     }
-
 }
 
 static struct notifier_block scsi_disk_nb = {
     .notifier_call = scsi_disk_probe_handler,
-    .priority = INT_MIN, //we want to be FIRST so that we other things can get the correct drive type
+    .priority = INT_MIN, // we want to be FIRST so that we other things can get the correct drive type
 };
 
 int register_fake_sata_boot_shim(const struct boot_media *config)
@@ -316,7 +325,8 @@ int register_fake_sata_boot_shim(const struct boot_media *config)
 
     pr_loc_dbg("Registering for new devices notifications");
     out = subscribe_scsi_disk_events(&scsi_disk_nb);
-    if (unlikely(out != 0)) {
+    if (unlikely(out != 0))
+    {
         pr_loc_err("Failed to register for SCSI disks notifications - error=%d", out);
         boot_dev_config = NULL;
         return out;
@@ -324,7 +334,8 @@ int register_fake_sata_boot_shim(const struct boot_media *config)
 
     pr_loc_dbg("Iterating over existing devices");
     out = for_each_scsi_disk(on_existing_scsi_disk_device);
-    if (unlikely(out != 0 && out != -ENXIO)) {
+    if (unlikely(out != 0 && out != -ENXIO))
+    {
         pr_loc_err("Failed to enumerate current SCSI disks - error=%d", out);
         boot_dev_config = NULL;
         return out;
@@ -342,5 +353,5 @@ int unregister_fake_sata_boot_shim(void)
     boot_dev_config = NULL;
 
     shim_ureg_ok();
-    return 0; //noop
+    return 0; // noop
 }
